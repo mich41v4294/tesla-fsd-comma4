@@ -39,8 +39,35 @@ No extra hardware needed. If your comma 4 is already working in your Tesla, this
 SSH into your comma and run:
 
 ```bash
+# FSD mod script
 curl -o /data/tesla_fsd_comma4.py \
   https://raw.githubusercontent.com/superpositiontime/tesla-fsd-comma4/main/tesla_fsd_comma4.py
+
+# Mode toggle server (web UI)
+curl -o /data/fsd_toggle_server.py \
+  https://raw.githubusercontent.com/superpositiontime/tesla-fsd-comma4/main/fsd_toggle_server.py
+```
+
+---
+
+## 📱 Web Toggle UI
+
+Switch between FSD and openpilot from your phone — no SSH needed after setup.
+
+**Start the toggle server:**
+
+```bash
+python3 /data/fsd_toggle_server.py
+```
+
+Then open **`http://<comma-ip>:8088`** in your phone browser (same WiFi).
+
+The UI shows current mode, live log output, and a single big button to switch. Switching takes ~5–10 seconds (stops one service, starts the other).
+
+**To auto-start on boot**, add to `/data/rc.local`:
+
+```bash
+python3 /data/fsd_toggle_server.py &
 ```
 
 ---
