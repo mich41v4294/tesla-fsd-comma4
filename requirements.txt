@@ -1,0 +1,2 @@
+# Dependencies are bundled with openpilot on the comma device
+# No pip install needed — panda and cereal are pre-installed
