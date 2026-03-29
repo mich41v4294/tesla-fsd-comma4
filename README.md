@@ -40,7 +40,7 @@ SSH into your comma and run:
 
 ```bash
 curl -o /data/tesla_fsd_comma4.py \
-  https://raw.githubusercontent.com/conormcnamee2014/tesla-fsd-comma4/main/tesla_fsd_comma4.py
+  https://raw.githubusercontent.com/superpositiontime/tesla-fsd-comma4/main/tesla_fsd_comma4.py
 ```
 
 ---
