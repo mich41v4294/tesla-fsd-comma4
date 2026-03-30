@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-FSD Toggle Server — runs on comma 4
+FSD Toggle Server — runs on comma 3
 Serves a mobile web UI to switch between FSD mode and openpilot mode.
 
 Usage:
@@ -16,7 +16,7 @@ import threading
 import time
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
-FSD_SCRIPT = "/data/tesla_fsd_comma4.py"
+FSD_SCRIPT = "/data/tesla_fsd_comma3_hw3.py"
 PORT = 8088
 
 # ── State ─────────────────────────────────────────────────────────────────────
@@ -138,7 +138,7 @@ HTML = """<!DOCTYPE html>
 <head>
 <meta charset="UTF-8"/>
 <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0"/>
-<title>comma 4 · Mode Switch</title>
+<title>comma 3 · Mode Switch</title>
 <style>
   :root {
     --bg: #0d0d0d;
@@ -277,7 +277,7 @@ HTML = """<!DOCTYPE html>
 </style>
 </head>
 <body>
-<h1>comma 4 · mode switch</h1>
+<h1>comma 3 · mode switch</h1>
 
 <div id="status-pill">
   <div class="dot"></div>
@@ -462,7 +462,7 @@ class Handler(BaseHTTPRequestHandler):
 if __name__ == "__main__":
     if not os.path.exists(FSD_SCRIPT):
         print(f"⚠️  FSD script not found at {FSD_SCRIPT}")
-        print(f"   Run: curl -o {FSD_SCRIPT} https://raw.githubusercontent.com/superpositiontime/tesla-fsd-comma4/main/tesla_fsd_comma4.py")
+        print(f"   Run: curl -o {FSD_SCRIPT} https://raw.githubusercontent.com/mich41v4294/tesla-fsd-comma4/main/tesla_fsd_comma3_hw3.py")
 
     log(f"FSD Toggle Server starting on port {PORT}...")
     log(f"Open http://<comma-ip>:{PORT} on your phone")
