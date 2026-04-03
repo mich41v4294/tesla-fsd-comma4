@@ -1,12 +1,16 @@
 [Unit]
 Description=Tesla FSD Toggle Server (Comma 3 / HW3)
-After=network.target
+# Start after /data is mounted (scripts and venv paths live there).
+After=network.target local-fs.target
+RequiresMountsFor=/data
 
 [Service]
 Type=simple
-ExecStart=/usr/bin/python3 /data/fsd_toggle_server.py
+# Match openpilot: panda lives under the openpilot tree; venv has usb1/opendbc.
+Environment=PYTHONPATH=/data/pythonpath
+ExecStart=/usr/local/venv/bin/python3 /data/fsd_toggle_server.py
 WorkingDirectory=/data
-Restart=on-failure
+Restart=always
 RestartSec=5
 
 [Install]

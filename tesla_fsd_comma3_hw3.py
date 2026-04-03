@@ -25,10 +25,11 @@ SCREEN INTEGRATION:
   When SHOW_ON_SCREEN = True, the script publishes status alerts to
   openpilot's cereal bus so they appear in the HUD.
 
-  This mode does NOT require stopping openpilot — it runs alongside it.
-  However: for raw CAN TX you must use SAFETY_ALLOUTPUT (stops openpilot
-  from driving). Screen-only monitoring (TRANSMIT = False) works with
-  openpilot running normally.
+  The HUD thread can use cereal while openpilot runs, but this script must
+  open the panda for CAN — openpilot’s pandad (and legacy boardd) own it while
+  those processes run, which causes USB BUSY and endless “CAN: BAD RECV”.
+  Stop openpilot and ensure no stray pandad: sudo systemctl stop openpilot
+  then sudo killall -KILL pandad boardd
 
 HOW TO USE (live + screen):
   1. SSH: ssh comma@comma.local
@@ -48,11 +49,13 @@ CAN_BUS         = 2       # Autopilot bus via comma harness (try 0 or 1 if broke
 LOG_FRAMES      = True    # Print frame activity to terminal
 # ──────────────────────────────────────────────────────────────────────────────
 
+import os
 import sys
 import time
 import threading
 import struct
 import random
+import subprocess
 
 # ── CAN Frame IDs ─────────────────────────────────────────────────────────────
 ID_FOLLOW_DISTANCE  = 1016   # 0x3F8
@@ -314,11 +317,211 @@ def _panda_safety_modes(Panda):
     )
 
 
+def _env_truthy(name: str) -> bool:
+    return os.environ.get(name, "").strip().lower() in ("1", "yes", "true")
+
+
+def _panda_spi_only_connect(Panda, serial: str):
+    """
+    Force SPI by making usb_connect return no handle so Panda.connect() calls spi_connect.
+    """
+    orig = Panda.usb_connect
+
+    @classmethod
+    def _usb_skipped(cls, _serial, claim=True, no_error=False):
+        return None, None, None, False
+
+    try:
+        Panda.usb_connect = _usb_skipped
+        return Panda(serial=serial, claim=True, cli=False)
+    finally:
+        Panda.usb_connect = orig
+
+
+def _prefer_spi_first() -> bool:
+    """Internal comma pandas use SPI; broken USB partial-open skips SPI and breaks can_recv."""
+    if _env_truthy("FSD_PANDA_USB_FIRST"):
+        return False
+    if _env_truthy("FSD_PANDA_SPI_ONLY") or _env_truthy("FSD_PANDA_SPI_FIRST"):
+        return True
+    try:
+        return os.path.exists("/AGNOS")
+    except OSError:
+        return False
+
+
+def _open_panda(Panda):
+    serials = Panda.list()
+    if not serials:
+        raise RuntimeError("No panda found (USB/SPI list empty)")
+    serial = serials[0]
+    last_err: Exception | None = None
+
+    attempts: list[tuple[str, object]] = []
+    if _env_truthy("FSD_PANDA_SPI_ONLY"):
+        attempts.append(("spi-only", None))
+    elif _prefer_spi_first():
+        attempts.extend(
+            [
+                ("spi-only", None),
+                ("usb+claim", True),
+                ("usb no-claim", False),
+            ]
+        )
+    else:
+        attempts.extend(
+            [
+                ("usb+claim", True),
+                ("usb no-claim", False),
+                ("spi-only", None),
+            ]
+        )
+
+    for label, claim in attempts:
+        for _ in range(6):
+            try:
+                if claim is None:
+                    p = _panda_spi_only_connect(Panda, serial)
+                else:
+                    p = Panda(serial=serial, claim=claim, cli=False)
+                link = "SPI" if p.is_connected_spi() else "USB"
+                print(f"  Panda link: {link} ({label})")
+                return p
+            except Exception as e:
+                last_err = e
+                time.sleep(0.35)
+    if last_err:
+        raise last_err
+    raise RuntimeError("Panda connect failed")
+
+
 def _unpack_can_msg(msg):
     if len(msg) == 3:
         return msg[0], msg[1], msg[2]
     addr, _, dat, src = msg
     return addr, dat, src
+
+
+def _read_proc_cmdline(pid: str) -> list[str]:
+    try:
+        with open(os.path.join("/proc", pid, "cmdline"), "rb") as f:
+            parts = f.read().split(b"\0")
+        return [p.decode("utf-8", "replace") for p in parts if p]
+    except OSError:
+        return []
+
+
+def _cmdline_looks_like_openpilot_panda_holder(argv: list[str]) -> bool:
+    """
+    True only for real pandad / boardd / manager processes.
+    pgrep -f '.../manager.py' falsely matches vim/nano/cat with that path in argv.
+    """
+    if not argv:
+        return False
+    joined = " ".join(argv)
+    low = joined.lower()
+    if "tesla_fsd_comma3" in low or "fsd_toggle_server" in low:
+        return False
+
+    base = os.path.basename(argv[0]).lower()
+    non_holder = frozenset({
+        "vim", "nvim", "vi", "view", "less", "more", "cat", "nano", "emacs",
+        "grep", "rg", "ag", "head", "tail", "sed", "awk", "bash", "sh", "zsh",
+        "ssh", "scp", "curl", "wget",
+    })
+    if base in non_holder:
+        return False
+
+    if base in ("pandad", "boardd"):
+        return True
+
+    is_py = base.startswith("python") or base == "python3" or "python" in base
+    if not is_py:
+        return False
+
+    norm = joined.replace("\\", "/")
+    if "selfdrive.pandad.pandad" in joined or "/selfdrive/pandad/pandad" in norm:
+        return True
+    if "pandad.py" in norm and "selfdrive" in low:
+        return True
+    if "boardd" in low and ("system/boardd" in norm or "/boardd/" in norm):
+        return True
+    if "manager.py" in norm and "/manager/" in norm and "openpilot" in low:
+        return True
+    if "manager.py" in norm and "/system/manager" in norm:
+        return True
+    return False
+
+
+def _panda_holder_pids() -> list[str]:
+    me, parent = str(os.getpid()), str(os.getppid())
+    out: list[str] = []
+    try:
+        names = os.listdir("/proc")
+    except OSError:
+        return out
+    for name in names:
+        if not name.isdigit() or name in (me, parent):
+            continue
+        if _cmdline_looks_like_openpilot_panda_holder(_read_proc_cmdline(name)):
+            out.append(name)
+    return sorted(out, key=int)
+
+
+def _assert_no_panda_holders():
+    """pandad/boardd/manager own the panda; a second client gets USB BUSY and BAD RECV."""
+    if os.environ.get("FSD_SKIP_HOLDER_CHECK", "").strip().lower() in ("1", "yes", "true"):
+        print("  [WARN] FSD_SKIP_HOLDER_CHECK set — skipping panda holder scan.\n")
+        return
+
+    try:
+        r = subprocess.run(
+            ["systemctl", "is-active", "openpilot"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        op_active = r.stdout.strip() == "active"
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        op_active = False
+
+    holders = _panda_holder_pids()
+    if not op_active and not holders:
+        return
+
+    lines = [
+        "\n  [ERROR] Something is still using the comma panda (USB will stay BUSY, CAN recv breaks).",
+        "",
+    ]
+    if op_active:
+        lines.append("  • systemd reports openpilot active (if you use another launcher, ignore):")
+        lines.append("      sudo systemctl stop openpilot")
+        lines.append("")
+    if holders:
+        lines.append("  • suspected holder process(es):")
+        native_pandad = False
+        for pid in holders:
+            argv = _read_proc_cmdline(pid)
+            j = " ".join(argv)
+            snippet = j[:120] + ("…" if len(j) > 120 else "")
+            lines.append(f"      PID {pid}: {snippet}")
+            if argv and os.path.basename(argv[0]) == "pandad":
+                native_pandad = True
+        lines.append("")
+        lines.append("      sudo killall -KILL pandad")
+        lines.append("      sudo killall -KILL boardd    # ok if: no process found")
+        if native_pandad:
+            lines.append("")
+            lines.append("    Native ./pandad owns the panda USB handle; without killing it you get BUSY / BAD RECV.")
+        lines.append("")
+        lines.append("    If pandad comes back immediately, the Python wrapper or manager is still running:")
+        lines.append("      sudo pkill -f 'selfdrive.pandad.pandad'")
+        lines.append("    Or stop openpilot in tmux (Ctrl+C) / your usual launcher, then retry.")
+        lines.append("")
+    lines.append("  False alarm?  FSD_SKIP_HOLDER_CHECK=1 python3 ...")
+    lines.append("  Or stop tmux/SSH sessions still running openpilot, then retry.\n")
+    print("\n".join(lines))
+    sys.exit(1)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -340,20 +543,12 @@ def main():
     safety_silent = None
 
     if not DUMMY_MODE:
+        _assert_no_panda_holders()
         try:
             from panda import Panda
 
             safety_all_output, safety_silent = _panda_safety_modes(Panda)
-            last_err = None
-            for _ in range(15):
-                try:
-                    panda = Panda()
-                    break
-                except Exception as e:
-                    last_err = e
-                    time.sleep(0.5)
-            else:
-                raise last_err
+            panda = _open_panda(Panda)
 
             print(f"  Panda FW: {panda.get_version()}")
             if TRANSMIT:
@@ -364,7 +559,8 @@ def main():
                 print("  Safety: default — openpilot can run alongside (monitor only)")
         except Exception as e:
             print(f"\n  [ERROR] Panda connect failed: {e}")
-            print("  If openpilot is running: sudo systemctl stop openpilot")
+            print("  Stop openpilot and kill stray daemons: sudo systemctl stop openpilot")
+            print("    sudo killall -KILL pandad boardd")
             sys.exit(1)
     else:
         print("  ⚠️  DUMMY MODE — using synthetic frames, no panda needed\n")

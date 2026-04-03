@@ -11,13 +11,29 @@ Then open http://<comma-ip>:8088 on your phone (same WiFi).
 
 import json
 import os
+import signal
 import subprocess
+import sys
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 FSD_SCRIPT = "/data/tesla_fsd_comma3_hw3.py"
 PORT = 8088
+
+# Same layout as openpilot launch_chffrplus.sh: PYTHONPATH = openpilot root (symlinked as /data/pythonpath).
+_VENV_PYTHON = "/usr/local/venv/bin/python3"
+
+
+def _comma_subprocess_env():
+    env = os.environ.copy()
+    for root in ("/data/pythonpath", "/data/openpilot"):
+        if os.path.isdir(root):
+            openpilot_root = os.path.realpath(root)
+            prev = env.get("PYTHONPATH", "").strip()
+            env["PYTHONPATH"] = openpilot_root if not prev else f"{openpilot_root}:{prev}"
+            break
+    return env
 
 # ── State ─────────────────────────────────────────────────────────────────────
 
@@ -50,15 +66,91 @@ def openpilot_running():
         return False
 
 
+def _read_cmdline(pid: str) -> list[str]:
+    try:
+        with open(os.path.join("/proc", pid, "cmdline"), "rb") as f:
+            return [x.decode("utf-8", "replace") for x in f.read().split(b"\0") if x]
+    except OSError:
+        return []
+
+
+def _panda_stack_pids() -> list[str]:
+    """Native ./pandad and Python selfdrive.pandad.pandad (respawns native if only native is killed)."""
+    out: list[str] = []
+    for name in os.listdir("/proc"):
+        if not name.isdigit():
+            continue
+        argv = _read_cmdline(name)
+        if not argv:
+            continue
+        base = os.path.basename(argv[0]).lower()
+        joined = " ".join(argv).lower()
+        if base == "pandad":
+            out.append(name)
+            continue
+        if base.startswith("python") and "selfdrive.pandad.pandad" in joined:
+            out.append(name)
+            continue
+        if base == "boardd" or "system/boardd" in joined.replace("\\", "/").lower():
+            out.append(name)
+    return sorted(out, key=int, reverse=True)
+
+
+def _sigkill_pids(pids: list[str]) -> list[str]:
+    killed: list[str] = []
+    for pid in pids:
+        try:
+            os.kill(int(pid), signal.SIGKILL)
+            killed.append(pid)
+        except (ProcessLookupError, ValueError):
+            pass
+        except PermissionError:
+            pass
+    return killed
+
+
+def _kill_stray_panda_daemons():
+    """
+    systemctl stop openpilot often does nothing when openpilot.service is absent;
+    native pandad still holds USB. Kill by PID (works as user comma) then sudo fallback.
+    """
+    for _round in range(3):
+        pids = _panda_stack_pids()
+        if not pids:
+            break
+        got = _sigkill_pids(pids)
+        if got:
+            log(f"Killed panda stack PID(s): {', '.join(got)}")
+        time.sleep(0.4)
+
+    for name in ("pandad", "boardd"):
+        r = subprocess.run(
+            ["sudo", "-n", "killall", "-KILL", name],
+            capture_output=True,
+            text=True,
+        )
+        if r.returncode != 0 and r.stderr.strip():
+            log(f"sudo killall {name}: {r.stderr.strip()}")
+    r = subprocess.run(
+        ["sudo", "-n", "pkill", "-KILL", "-f", "selfdrive.pandad.pandad"],
+        capture_output=True,
+        text=True,
+    )
+    if r.returncode not in (0, 1) and r.stderr.strip():
+        log(f"sudo pkill pandad wrapper: {r.stderr.strip()}")
+    time.sleep(1)
+
+
 def stop_openpilot():
     log("Stopping openpilot...")
     subprocess.run(["sudo", "systemctl", "stop", "openpilot"], capture_output=True)
-    # Wait until inactive so boardd releases the panda USB interface (avoids LIBUSB_ERROR_BUSY).
+    # Wait until inactive so pandad/boardd release the panda USB interface.
     for _ in range(30):
         if not openpilot_running():
             break
         time.sleep(0.5)
-    time.sleep(3)
+    time.sleep(2)
+    _kill_stray_panda_daemons()
     log("openpilot stopped.")
 
 
@@ -71,11 +163,14 @@ def start_openpilot():
 
 def start_fsd():
     log("Starting FSD script...")
+    _kill_stray_panda_daemons()
+    py = _VENV_PYTHON if os.path.isfile(_VENV_PYTHON) else sys.executable
     proc = subprocess.Popen(
-        ["python3", FSD_SCRIPT],
+        [py, FSD_SCRIPT],
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
-        text=True
+        text=True,
+        env=_comma_subprocess_env(),
     )
     state["fsd_pid"] = proc.pid
     log(f"FSD script running (PID {proc.pid})")
