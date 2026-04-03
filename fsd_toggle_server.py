@@ -20,6 +20,9 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 
 FSD_SCRIPT = "/data/tesla_fsd_comma3_hw3.py"
 PORT = 8088
+# Keep in sync with CAN_STATS_PATH in tesla_fsd_comma3_hw3.py
+CAN_STATS_PATH = "/tmp/fsd_can_stats.json"
+CAN_STATS_STALE_SEC = 10.0
 
 # Same layout as openpilot launch_chffrplus.sh: PYTHONPATH = openpilot root (symlinked as /data/pythonpath).
 _VENV_PYTHON = "/usr/local/venv/bin/python3"
@@ -51,6 +54,33 @@ def log(msg):
     print(line)
     state["log"].insert(0, line)
     state["log"] = state["log"][:50]
+
+
+def _read_can_stats_payload():
+    """
+    Returns (stats_dict_or_none, stale_bool) for /status when in FSD mode.
+    Stale if file missing, corrupt, script reports running=false, or updated_at too old.
+    """
+    try:
+        with open(CAN_STATS_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return None, True
+
+    if not isinstance(data, dict):
+        return None, True
+
+    stale = False
+    if not data.get("running", True):
+        stale = True
+    updated = data.get("updated_at")
+    try:
+        if updated is not None and (time.time() - float(updated)) > CAN_STATS_STALE_SEC:
+            stale = True
+    except (TypeError, ValueError):
+        stale = True
+
+    return data, stale
 
 
 # ── Process control ────────────────────────────────────────────────────────────
@@ -374,6 +404,68 @@ HTML = """<!DOCTYPE html>
     margin: 0 auto;
   }
   @keyframes spin { to { transform: rotate(360deg); } }
+
+  /* CAN debug */
+  #can-debug {
+    width: 100%;
+    max-width: 340px;
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-radius: 14px;
+    padding: 14px;
+  }
+  #can-debug .section-title {
+    font-size: .7rem;
+    color: var(--muted);
+    text-transform: uppercase;
+    letter-spacing: .06em;
+    margin-bottom: 10px;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+  }
+  #can-debug .stale-badge {
+    font-size: .65rem;
+    color: #f59e0b;
+    font-weight: 600;
+    text-transform: none;
+    letter-spacing: 0;
+  }
+  .can-cards {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+    margin-bottom: 10px;
+  }
+  .can-cards .mini {
+    flex: 1 1 30%;
+    min-width: 88px;
+    background: var(--bg);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 8px 6px;
+    text-align: center;
+  }
+  .can-cards .mini .label { font-size: .6rem; color: var(--muted); margin-bottom: 4px; }
+  .can-cards .mini .value { font-size: .95rem; font-weight: 700; }
+  .can-line {
+    font-size: .68rem;
+    color: var(--muted);
+    line-height: 1.5;
+    margin-bottom: 6px;
+  }
+  .can-line strong { color: var(--text); font-weight: 600; }
+  .can-hex {
+    font-family: 'SF Mono', ui-monospace, monospace;
+    font-size: .62rem;
+    word-break: break-all;
+    color: #a3a3a3;
+    margin-top: 2px;
+    max-height: 72px;
+    overflow-y: auto;
+  }
+  .can-placeholder { font-size: .72rem; color: var(--muted); line-height: 1.5; }
 </style>
 </head>
 <body>
@@ -398,6 +490,14 @@ HTML = """<!DOCTYPE html>
     <div class="label">openpilot</div>
     <div class="value" id="op-status">–</div>
   </div>
+</div>
+
+<div id="can-debug">
+  <div class="section-title">
+    <span>CAN debug</span>
+    <span class="stale-badge" id="can-stale" style="display:none">Stale</span>
+  </div>
+  <div id="can-body" class="can-placeholder">Run FSD mode to see CAN stats.</div>
 </div>
 
 <div id="log-box"><div class="log-line" style="color:#444">Waiting for log…</div></div>
@@ -455,6 +555,65 @@ function update(d) {
   box.innerHTML = (d.log || []).map(l =>
     '<div class="log-line">'+escHtml(l)+'</div>'
   ).join('') || '<div class="log-line" style="color:#444">No log yet.</div>';
+
+  updateCanDebug(d);
+}
+
+const profileNames = {0: 'Chill', 1: 'Normal', 2: 'Hurry'};
+
+function updateCanDebug(d) {
+  const body = document.getElementById('can-body');
+  const staleEl = document.getElementById('can-stale');
+  staleEl.style.display = 'none';
+
+  if (d.mode !== 'fsd') {
+    body.className = 'can-placeholder';
+    body.textContent = 'Run FSD mode to see CAN stats.';
+    return;
+  }
+
+  const s = d.can_stats;
+  if (!s) {
+    body.className = 'can-placeholder';
+    body.textContent = 'Waiting for FSD script stats (/tmp/fsd_can_stats.json not ready yet)…';
+    staleEl.style.display = d.can_stats_stale ? 'inline' : 'none';
+    staleEl.textContent = 'Stale';
+    return;
+  }
+
+  if (d.can_stats_stale) {
+    staleEl.style.display = 'inline';
+    staleEl.textContent = s.running === false ? 'Stopped' : 'Stale';
+  }
+
+  const mux = s.mods_by_mux || {};
+  const p = profileNames[s.speed_profile] != null ? profileNames[s.speed_profile] : String(s.speed_profile);
+
+  body.className = '';
+  body.innerHTML =
+    '<div class="can-cards">' +
+      mini('Captured', s.frames_total) +
+      mini('Modified', s.frames_modified) +
+      mini('ID 1016', s.frames_id_1016) +
+      mini('ID 1021', s.frames_id_1021) +
+      mini('Other IDs', s.frames_other) +
+    '</div>' +
+    '<div class="can-line"><strong>State</strong> · FSD ' + (s.fsd_active ? 'active' : 'waiting') +
+    ' · Nag ' + (s.nag_suppressed ? 'suppressed' : 'on') +
+    ' · Profile ' + escHtml(String(p)) + ' · Offset ' + escHtml(String(s.speed_offset)) + '</div>' +
+    '<div class="can-line"><strong>Mods by mux</strong> · 0:' + escHtml(String(mux[0] ?? '–')) +
+    ' · 1:' + escHtml(String(mux[1] ?? '–')) + ' · 2:' + escHtml(String(mux[2] ?? '–')) + '</div>' +
+    '<div class="can-line"><strong>Bus / flags</strong> · can_bus ' + escHtml(String(s.can_bus)) +
+    ' · transmit ' + escHtml(String(s.transmit)) + ' · dummy ' + escHtml(String(s.dummy_mode)) +
+    ' · pid ' + escHtml(String(s.pid)) + '</div>' +
+    '<div class="can-line"><strong>Last 1016</strong><div class="can-hex">' + escHtml(s.last_1016_hex || '–') + '</div></div>' +
+    '<div class="can-line"><strong>Last 1021 in</strong><div class="can-hex">' + escHtml(s.last_1021_in_hex || '–') + '</div></div>' +
+    '<div class="can-line"><strong>Last 1021 out</strong><div class="can-hex">' + escHtml(s.last_1021_out_hex || '–') + '</div></div>';
+}
+
+function mini(label, val) {
+  const v = val != null ? val : '–';
+  return '<div class="mini"><div class="label">' + escHtml(label) + '</div><div class="value">' + escHtml(String(v)) + '</div></div>';
 }
 
 function escHtml(s) {
@@ -531,13 +690,21 @@ class Handler(BaseHTTPRequestHandler):
             self.wfile.write(body)
 
         elif self.path == "/status":
-            self.send_json({
+            payload = {
                 "mode": state["mode"],
                 "fsd_pid": state["fsd_pid"],
                 "switched_at": state["switched_at"],
                 "openpilot_running": openpilot_running(),
                 "log": state["log"][:20],
-            })
+            }
+            if state["mode"] == "fsd":
+                stats, stale = _read_can_stats_payload()
+                payload["can_stats"] = stats
+                payload["can_stats_stale"] = stale
+            else:
+                payload["can_stats"] = None
+                payload["can_stats_stale"] = False
+            self.send_json(payload)
         else:
             self.send_response(404)
             self.end_headers()

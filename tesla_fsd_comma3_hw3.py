@@ -49,6 +49,7 @@ CAN_BUS         = 2       # Autopilot bus via comma harness (try 0 or 1 if broke
 LOG_FRAMES      = True    # Print frame activity to terminal
 # ──────────────────────────────────────────────────────────────────────────────
 
+import json
 import os
 import sys
 import time
@@ -61,6 +62,10 @@ import subprocess
 ID_FOLLOW_DISTANCE  = 1016   # 0x3F8
 ID_AUTOPILOT_CMD    = 1021   # 0x3FD
 
+# Web / fsd_toggle_server reads this path (keep in sync with fsd_toggle_server.py)
+CAN_STATS_PATH = "/tmp/fsd_can_stats.json"
+CAN_STATS_WRITE_INTERVAL = 0.75  # seconds
+
 # ── State ─────────────────────────────────────────────────────────────────────
 speed_profile   = 1   # 0=Chill  1=Normal  2=Hurry
 speed_offset    = 0   # HW3: scroll-wheel derived offset (0-100), sent on mux index 2
@@ -68,6 +73,13 @@ fsd_active      = False
 nag_suppressed  = False
 frames_total    = 0
 frames_modified = 0
+frames_id_1016  = 0
+frames_id_1021  = 0
+frames_other    = 0   # on CAN_BUS, not 1016/1021
+mods_by_mux     = {0: 0, 1: 0, 2: 0}
+last_1016_hex       = ""
+last_1021_in_hex    = ""
+last_1021_out_hex   = ""
 start_time      = time.time()
 
 
@@ -92,7 +104,8 @@ def handle_follow_distance(data: bytes) -> None:
     3 levels: fd=1 → Hurry (2), fd=2 → Normal (1), fd=3 → Chill (0).
     (HW4 used 5 levels and different indices.)
     """
-    global speed_profile
+    global speed_profile, last_1016_hex
+    last_1016_hex = data.hex()
     fd = (data[5] & 0b11100000) >> 5
     mapping = {1: 2, 2: 1, 3: 0}   # HW3: 3-level mapping
     if fd in mapping:
@@ -122,7 +135,9 @@ def handle_autopilot_cmd(panda, data: bytes) -> None:
       • HW4 wrote a speed profile into data[7] bits 4-6 here — HW3 differs.
     """
     global fsd_active, nag_suppressed, frames_modified, speed_profile, speed_offset
+    global last_1021_in_hex, last_1021_out_hex, mods_by_mux
 
+    last_1021_in_hex = data.hex()
     index       = data[0] & 0x07
     fsd_in_ui   = bool((data[4] >> 6) & 0x01)
     modified    = bytearray(data)
@@ -178,6 +193,8 @@ def handle_autopilot_cmd(panda, data: bytes) -> None:
 
     if did_modify:
         frames_modified += 1
+        mods_by_mux[index] += 1
+        last_1021_out_hex = bytes(modified).hex()
         if TRANSMIT and panda is not None:
             panda.can_send(ID_AUTOPILOT_CMD, bytes(modified), CAN_BUS)
 
@@ -296,6 +313,52 @@ def print_status():
         f"  Frames modified: {frames_modified}\n"
         f"  ────────────────────────────────────────────────\n"
     )
+
+
+def bump_frame_stats(addr: int) -> None:
+    global frames_total, frames_id_1016, frames_id_1021, frames_other
+    frames_total += 1
+    if addr == ID_FOLLOW_DISTANCE:
+        frames_id_1016 += 1
+    elif addr == ID_AUTOPILOT_CMD:
+        frames_id_1021 += 1
+    else:
+        frames_other += 1
+
+
+def write_can_stats_snapshot(running: bool = True) -> None:
+    """Atomic JSON for fsd_toggle_server /status (best-effort)."""
+    snap = {
+        "updated_at": time.time(),
+        "running": running,
+        "pid": os.getpid(),
+        "dummy_mode": DUMMY_MODE,
+        "transmit": TRANSMIT,
+        "can_bus": CAN_BUS,
+        "frames_total": frames_total,
+        "frames_modified": frames_modified,
+        "frames_id_1016": frames_id_1016,
+        "frames_id_1021": frames_id_1021,
+        "frames_other": frames_other,
+        "mods_by_mux": dict(mods_by_mux),
+        "fsd_active": fsd_active,
+        "nag_suppressed": nag_suppressed,
+        "speed_profile": speed_profile,
+        "speed_offset": speed_offset,
+        "last_1016_hex": last_1016_hex,
+        "last_1021_in_hex": last_1021_in_hex,
+        "last_1021_out_hex": last_1021_out_hex,
+    }
+    tmp = CAN_STATS_PATH + ".tmp"
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(snap, f, separators=(",", ":"))
+        os.replace(tmp, CAN_STATS_PATH)
+    except OSError:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -528,8 +591,6 @@ def _assert_no_panda_holders():
 # Main
 # ──────────────────────────────────────────────────────────────────────────────
 def main():
-    global frames_total
-
     print("\n" + "═" * 62)
     print("  Tesla FSD CAN Mod — Comma 3 Edition  (HW3 / V12-V13)  v2.0")
     print("═" * 62)
@@ -571,19 +632,25 @@ def main():
     print("  Listening for CAN frames... Press Ctrl+C to stop.\n")
 
     last_status_print = time.time()
+    last_can_stats_write = 0.0
+    write_can_stats_snapshot()
 
     try:
         if DUMMY_MODE:
             # ── Dummy mode: iterate synthetic frames ──────────────────────────
             for addr, dat in generate_dummy_frames():
-                frames_total += 1
+                bump_frame_stats(addr)
                 if addr == ID_FOLLOW_DISTANCE:
                     handle_follow_distance(dat)
                 elif addr == ID_AUTOPILOT_CMD:
                     handle_autopilot_cmd(None, dat)
-                if time.time() - last_status_print >= 5:
+                now = time.time()
+                if now - last_can_stats_write >= CAN_STATS_WRITE_INTERVAL:
+                    write_can_stats_snapshot()
+                    last_can_stats_write = now
+                if now - last_status_print >= 5:
                     print_status()
-                    last_status_print = time.time()
+                    last_status_print = now
 
         else:
             # ── Live mode: read from panda ────────────────────────────────────
@@ -593,20 +660,25 @@ def main():
                     addr, dat, src = _unpack_can_msg(msg)
                     if src != CAN_BUS:
                         continue
-                    frames_total += 1
+                    bump_frame_stats(addr)
                     if addr == ID_FOLLOW_DISTANCE:
                         handle_follow_distance(dat)
                     elif addr == ID_AUTOPILOT_CMD:
                         handle_autopilot_cmd(panda, dat)
-                if time.time() - last_status_print >= 5:
+                now = time.time()
+                if now - last_can_stats_write >= CAN_STATS_WRITE_INTERVAL:
+                    write_can_stats_snapshot()
+                    last_can_stats_write = now
+                if now - last_status_print >= 5:
                     print_status()
-                    last_status_print = time.time()
+                    last_status_print = now
 
     except KeyboardInterrupt:
         print("\n\n  Stopped by user.")
         print_status()
 
     finally:
+        write_can_stats_snapshot(running=False)
         stop_screen_integration()
         if panda is not None and TRANSMIT and safety_silent is not None:
             panda.set_safety_mode(safety_silent)
