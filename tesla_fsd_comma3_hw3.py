@@ -296,6 +296,32 @@ def print_status():
 
 
 # ──────────────────────────────────────────────────────────────────────────────
+# Panda / opendbc (safety modes moved to CarParams on current comma software)
+# ──────────────────────────────────────────────────────────────────────────────
+def _panda_safety_modes(Panda):
+    try:
+        from opendbc.car.structs import CarParams
+        return CarParams.SafetyModel.allOutput, CarParams.SafetyModel.silent
+    except ImportError:
+        pass
+    al = getattr(Panda, "SAFETY_ALLOUTPUT", None)
+    sil = getattr(Panda, "SAFETY_SILENT", None)
+    if al is not None and sil is not None:
+        return al, sil
+    raise RuntimeError(
+        "Cannot resolve panda safety modes: install opendbc (CarParams.SafetyModel) "
+        "or use a panda build that defines Panda.SAFETY_ALLOUTPUT / SAFETY_SILENT."
+    )
+
+
+def _unpack_can_msg(msg):
+    if len(msg) == 3:
+        return msg[0], msg[1], msg[2]
+    addr, _, dat, src = msg
+    return addr, dat, src
+
+
+# ──────────────────────────────────────────────────────────────────────────────
 # Main
 # ──────────────────────────────────────────────────────────────────────────────
 def main():
@@ -311,14 +337,27 @@ def main():
     print("═" * 62 + "\n")
 
     panda = None
+    safety_silent = None
 
     if not DUMMY_MODE:
         try:
             from panda import Panda
-            panda = Panda()
+
+            safety_all_output, safety_silent = _panda_safety_modes(Panda)
+            last_err = None
+            for _ in range(15):
+                try:
+                    panda = Panda()
+                    break
+                except Exception as e:
+                    last_err = e
+                    time.sleep(0.5)
+            else:
+                raise last_err
+
             print(f"  Panda FW: {panda.get_version()}")
             if TRANSMIT:
-                panda.set_safety_mode(Panda.SAFETY_ALLOUTPUT)
+                panda.set_safety_mode(safety_all_output)
                 panda.set_can_speed_kbps(CAN_BUS, 500)
                 print("  Safety: ALLOUTPUT — openpilot driving DISABLED while running")
             else:
@@ -354,7 +393,8 @@ def main():
             # ── Live mode: read from panda ────────────────────────────────────
             while True:
                 messages = panda.can_recv()
-                for addr, _, dat, src in messages:
+                for msg in messages:
+                    addr, dat, src = _unpack_can_msg(msg)
                     if src != CAN_BUS:
                         continue
                     frames_total += 1
@@ -372,8 +412,8 @@ def main():
 
     finally:
         stop_screen_integration()
-        if panda is not None and TRANSMIT:
-            panda.set_safety_mode(Panda.SAFETY_SILENT)
+        if panda is not None and TRANSMIT and safety_silent is not None:
+            panda.set_safety_mode(safety_silent)
             print("  Panda → SILENT mode. Safe to restart openpilot:")
             print("  sudo systemctl start openpilot\n")
         print("  👋 Bye!\n")

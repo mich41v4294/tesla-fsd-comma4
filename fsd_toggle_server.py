@@ -53,7 +53,12 @@ def openpilot_running():
 def stop_openpilot():
     log("Stopping openpilot...")
     subprocess.run(["sudo", "systemctl", "stop", "openpilot"], capture_output=True)
-    time.sleep(2)
+    # Wait until inactive so boardd releases the panda USB interface (avoids LIBUSB_ERROR_BUSY).
+    for _ in range(30):
+        if not openpilot_running():
+            break
+        time.sleep(0.5)
+    time.sleep(3)
     log("openpilot stopped.")
 
 
