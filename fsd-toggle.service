@@ -1,13 +1,21 @@
 [Unit]
 Description=Tesla FSD Toggle Server (Comma 3 / HW3)
-# Start after /data is mounted (scripts and venv paths live there).
 After=network.target local-fs.target
-RequiresMountsFor=/data
+# INSTALL: Put a real copy of this file at /etc/systemd/system/fsd-toggle.service
+# (not a symlink into /data). If the unit definition lives only on /data, systemd
+# can fail to schedule it at boot → enabled but inactive, journalctl -u shows nothing.
+# Also run: systemctl enable fsd-toggle.timer  (timers.target is pulled every boot.)
+# Do not use RequiresMountsFor=/data here: on some comma/AGNOS images /data is not a
+# distinct systemd mount, and that directive can leave this unit never started
+# (enabled but inactive after reboot). We wait for files in ExecStartPre instead.
 
 [Service]
 Type=simple
 # Match openpilot: panda lives under the openpilot tree; venv has usb1/opendbc.
 Environment=PYTHONPATH=/data/pythonpath
+# Wait until /data is populated (slow USB / late mount). Avoids one-shot failure at boot.
+ExecStartPre=/bin/sh -c 'i=0; while [ "$i" -lt 120 ]; do test -f /data/fsd_toggle_server.py && test -x /usr/local/venv/bin/python3 && exit 0; i=$((i+1)); sleep 1; done; echo "fsd-toggle: timeout waiting for /data or venv"; exit 1'
+TimeoutStartSec=150
 ExecStart=/usr/local/venv/bin/python3 /data/fsd_toggle_server.py
 WorkingDirectory=/data
 Restart=always
@@ -15,3 +23,4 @@ RestartSec=5
 
 [Install]
 WantedBy=multi-user.target
+WantedBy=graphical.target

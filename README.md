@@ -46,22 +46,33 @@ In your Tesla: **Controls → Software → Additional Vehicle Information**
 
 ## Installation
 
+Runtime scripts live on **`/data`**. **Systemd unit files** (`.service` / `.timer`) must be
+installed as **regular files** under `/etc/systemd/system/` — **not** symlinks into `/data`.
+If the unit definition only exists on `/data`, systemd may never schedule the service at boot
+(enabled but **inactive**, and `journalctl -u fsd-toggle` shows no lines).
+
 ### 1 — Copy files to the comma 3
 
 ```bash
-scp tesla_fsd_comma3_hw3.py fsd_toggle_server.py fsd-toggle.service comma@comma.local:/data/
+ssh comma@comma.local mkdir -p /data/scripts
+scp tesla_fsd_comma3_hw3.py fsd_toggle_server.py \
+  fsd-toggle.service fsd-toggle.timer \
+  comma@comma.local:/data/
+scp scripts/install-fsd-systemd.sh comma@comma.local:/data/scripts/
 ```
 
 Or directly on the device:
 
 ```bash
 ssh comma@comma.local
-curl -o /data/tesla_fsd_comma3_hw3.py \
-  https://raw.githubusercontent.com/<your-fork>/main/tesla_fsd_comma3_hw3.py
-curl -o /data/fsd_toggle_server.py \
-  https://raw.githubusercontent.com/<your-fork>/main/fsd_toggle_server.py
-curl -o /data/fsd-toggle.service \
-  https://raw.githubusercontent.com/<your-fork>/main/fsd-toggle.service
+mkdir -p /data/scripts
+# replace <your-fork> / branch as needed
+for f in tesla_fsd_comma3_hw3.py fsd_toggle_server.py fsd-toggle.service fsd-toggle.timer; do
+  curl -o "/data/$f" "https://raw.githubusercontent.com/<your-fork>/main/$f"
+done
+curl -o /data/scripts/install-fsd-systemd.sh \
+  https://raw.githubusercontent.com/<your-fork>/main/scripts/install-fsd-systemd.sh
+chmod +x /data/scripts/install-fsd-systemd.sh
 ```
 
 ### 2 — Test offline first (no car needed)
@@ -81,6 +92,10 @@ You should see synthetic frames being processed and a status printout every 5 se
 python3 /data/fsd_toggle_server.py &
 ```
 
+The **systemd** unit uses `/usr/local/venv/bin/python3` and `PYTHONPATH=/data/pythonpath` so the
+child FSD script can import `panda` / `opendbc`. A plain `python3` from ssh may need the same
+(see [Troubleshooting](#troubleshooting)).
+
 Open `http://<comma-ip>:8088` on your phone (same WiFi). Use the big button to
 switch between **FSD mode** (stops openpilot, starts the CAN mod) and
 **Comma / openpilot mode**.
@@ -96,15 +111,32 @@ python3 /data/tesla_fsd_comma3_hw3.py
 
 ### 5 — Auto-start on boot (optional)
 
-Install the included systemd service so the toggle server launches every time the
-comma 3 powers on:
+The unit uses **`/usr/local/venv/bin/python3`**, **`PYTHONPATH=/data/pythonpath`**, and waits (up to
+~120s in `ExecStartPre`) for `/data/fsd_toggle_server.py` and the venv so a slow `/data` mount
+does not fail the first start. **`fsd-toggle.timer`** starts the service once per boot after
+45s via **`timers.target`** (reliable if `multi-user.target` / `graphical.target` alone do not
+pull the service).
+
+**Recommended:** install **real copies** of both units in `/etc`, then enable service + timer:
 
 ```bash
-ssh comma@comma.local
+sudo sh /data/scripts/install-fsd-systemd.sh
+```
+
+The script remounts `/` read-write, copies [`fsd-toggle.service`](fsd-toggle.service) and
+[`fsd-toggle.timer`](fsd-toggle.timer) from `/data` into `/etc/systemd/system/`, runs
+`daemon-reload`, and `enable --now` for both.
+
+**Manual equivalent:**
+
+```bash
 sudo mount -o remount,rw /
-sudo ln -sf /data/fsd-toggle.service /etc/systemd/system/fsd-toggle.service
+sudo rm -f /etc/systemd/system/fsd-toggle.service /etc/systemd/system/fsd-toggle.timer
+sudo cp /data/fsd-toggle.service /etc/systemd/system/fsd-toggle.service
+sudo cp /data/fsd-toggle.timer   /etc/systemd/system/fsd-toggle.timer
 sudo systemctl daemon-reload
-sudo systemctl enable fsd-toggle
+sudo systemctl enable --now fsd-toggle.service
+sudo systemctl enable --now fsd-toggle.timer
 sudo mount -o remount,ro /
 ```
 
@@ -113,22 +145,27 @@ Reboot and verify:
 ```bash
 sudo reboot
 # after reboot:
-systemctl status fsd-toggle
+ls -la /etc/systemd/system/fsd-toggle.service   # should be a file, not -> /data/...
+systemctl status fsd-toggle --no-pager
+systemctl list-timers --all | grep fsd
+journalctl -u fsd-toggle -u fsd-toggle.timer -b --no-pager
 ```
 
-The toggle server will now auto-start on every boot at `http://<comma-ip>:8088`.
+The toggle server should be reachable at `http://<comma-ip>:8088`.
 
-To disable auto-start later:
+**Disable auto-start** (disable both; otherwise the timer may still start the service):
 
 ```bash
 sudo mount -o remount,rw /
-sudo systemctl disable fsd-toggle
+sudo systemctl disable fsd-toggle.service
+sudo systemctl disable fsd-toggle.timer
 sudo mount -o remount,ro /
 ```
 
-> **Note:** The `mount -o remount,rw /` step is needed because AGNOS mounts the
-> root filesystem as read-only. The symlink in `/etc/systemd/system/` persists
-> across normal reboots but may need to be re-created after an AGNOS update.
+> **Note:** AGNOS mounts `/` read-only; use `mount -o remount,rw /` before changing `/etc`.
+> After an AGNOS update, re-copy unit files from `/data` if `/etc` was reset. **Do not** use
+> `ln -sf /data/fsd-toggle.service /etc/systemd/system/` for the unit definition — that pattern
+> breaks boot scheduling on many comma builds.
 
 ---
 
@@ -154,10 +191,28 @@ Edit the top of `tesla_fsd_comma3_hw3.py`:
 | Flag | Default | Description |
 |------|---------|-------------|
 | `DUMMY_MODE` | `False` | `True` = offline test with fake frames |
-| `TRANSMIT` | `True` | `True` = modify & retransmit (needs ALLOUTPUT) |
+| `TRANSMIT` | `True` | `True` = modify & retransmit; uses `CarParams.SafetyModel.allOutput` (current comma stack), not legacy `Panda.SAFETY_ALLOUTPUT` |
 | `SHOW_ON_SCREEN` | `True` | Show status in openpilot HUD via cereal |
 | `CAN_BUS` | `2` | Vehicle CAN bus number (try 0 or 1 if nothing is seen) |
 | `LOG_FRAMES` | `True` | Print frame activity to terminal |
+
+### Environment variables (`tesla_fsd_comma3_hw3.py`)
+
+| Variable | Purpose |
+|----------|---------|
+| `FSD_SKIP_HOLDER_CHECK` | Set to `1` to skip the pre-flight scan for `pandad` / `boardd` / manager (debug only). |
+| `FSD_PANDA_SPI_ONLY` | Force SPI-only panda connection (bypass USB). |
+| `FSD_PANDA_SPI_FIRST` | Prefer SPI before USB even off AGNOS. |
+| `FSD_PANDA_USB_FIRST` | Prefer USB before SPI on comma (default on AGNOS is SPI-first to avoid USB `BUSY` / `CAN: BAD RECV`). |
+
+---
+
+## Troubleshooting
+
+- **`openpilot.service` not loaded** — Your stack may run from tmux instead of systemd. Stop openpilot there, or kill the panda daemons before FSD mode: `sudo killall -KILL pandad` (and `boardd` if present). The toggle server also tries to kill native `pandad`, the Python `selfdrive.pandad.pandad` wrapper, and `boardd` after stopping openpilot.
+- **`LIBUSB_ERROR_BUSY` / `CAN: BAD RECV, RETRYING`** — Another process still owns the panda (usually `./pandad`). Kill it as above. On AGNOS the script prefers **SPI** first; use `FSD_PANDA_USB_FIRST=1` if you must force USB on an external panda setup.
+- **`No module named 'panda'`** — The systemd service sets `PYTHONPATH=/data/pythonpath` and uses the comma venv. For manual runs: `PYTHONPATH=/data/pythonpath /usr/local/venv/bin/python3 /data/tesla_fsd_comma3_hw3.py` (or run from a shell where openpilot’s paths are already set).
+- **Holder check false positive** — Rare; use `FSD_SKIP_HOLDER_CHECK=1` only if you are sure nothing holds the panda.
 
 ---
 

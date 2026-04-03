@@ -1,0 +1,11 @@
+[Unit]
+Description=Start FSD Toggle Server after boot (timers.target always runs; use if multi-user never pulls the service)
+
+[Timer]
+# Let /data and venv settle; then start the service once per boot.
+OnBootSec=45
+Unit=fsd-toggle.service
+AccuracySec=5
+
+[Install]
+WantedBy=timers.target
